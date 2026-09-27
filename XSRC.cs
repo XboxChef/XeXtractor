@@ -38,7 +38,14 @@ namespace XeXtractor
             int count2 = er.ReadInt32();
             GZipStream gzipStream = new GZipStream((Stream)new MemoryStream(er.ReadBytes(count2)), CompressionMode.Decompress, true);
             byte[] buffer = new byte[count1];
-            gzipStream.Read(buffer, 0, count1);
+            int offset = 0;
+            while (offset < count1)
+            {
+                int read = gzipStream.Read(buffer, offset, count1 - offset);
+                if (read == 0)
+                    throw new Exception("XSRC data is truncated");
+                offset += read;
+            }
             gzipStream.Close();
             InnerFileStructure.getInstance().AddFileEntry(new FileEntry()
             {
