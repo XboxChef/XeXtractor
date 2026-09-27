@@ -11,6 +11,8 @@ namespace XeXtractor
 
         private static bool Is64Bit => XCompress.IsMachine64Bit;
 
+        public static string LibraryName => XCompress.Is64Bit ? "xcompress64.dll" : "xcompress32.dll";
+
         [DllImport("xcompress32.dll", EntryPoint = "LDICreateDecompression")]
         private static extern int LDICreateDecompression32(
           ref int pcbDataBlockMax,

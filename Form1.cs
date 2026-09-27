@@ -10,23 +10,62 @@ namespace XeXtractor
     {
         private const string SupportUrl = "https://www.paypal.com/donate/?hosted_button_id=XGX526XVYTNR8";
 
+        private static readonly string TempFolder = Path.Combine(Path.GetTempPath(), "XeXtractor");
+
+        private bool isParsing;
+
         public Form1()
         {
             InitializeComponent();
             treeView1.MouseUp += treeView1_MouseUp;
             FileHandler.ParseCompleted += FileHandler_ParseCompleted;
             Log.getInstance().LogChanged += Form1_LogChanged;
+            FormClosed += Form1_FormClosed;
+        }
+
+        // The parser thread can outlive the form, so a closed window must not crash it.
+        private void InvokeIfAlive(Delegate method, params object[] args)
+        {
+            try
+            {
+                if (!IsDisposed)
+                    Invoke(method, args);
+            }
+            catch (ObjectDisposedException)
+            {
+            }
+            catch (InvalidOperationException)
+            {
+                // Window handle already destroyed.
+            }
+        }
+
+        private void StartParse(string fileName)
+        {
+            if (isParsing)
+            {
+                MessageBox.Show("Please wait until the current file has finished loading.", "XeXtractor",
+                    MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+
+            isParsing = true;
+            UseWaitCursor = true;
+            Log.getInstance().Clear();
+            InnerFileStructure.getInstance().Clear();
+            FileHandler.HandleFile(fileName);
         }
 
         private void FileHandler_ParseCompleted(object sender, EventArgs e)
         {
             if (InvokeRequired)
             {
-                Invoke(new EventHandler(FileHandler_ParseCompleted), sender, e);
+                InvokeIfAlive(new EventHandler(FileHandler_ParseCompleted), sender, e);
                 return;
             }
 
-            Cursor.Current = Cursors.Default;
+            isParsing = false;
+            UseWaitCursor = false;
             FileEntry[] files = InnerFileStructure.getInstance().getFiles();
             treeView1.Nodes.Clear();
             foreach (FileEntry file in files)
@@ -82,7 +121,7 @@ namespace XeXtractor
                     lblFsize.Text = totalSize < 1024L
                         ? totalSize + " Bytes"
                         : (totalSize / 1024L) + " KB";
-                    pctPreview.Image = null;
+                    SetPreviewImage(null);
                     lblType.Text = "";
                 }
                 else
@@ -94,13 +133,7 @@ namespace XeXtractor
                         ? dataLength + " Bytes"
                         : (dataLength / 1024) + " KB";
                     lblType.Text = tag.type;
-                    if (selectedNode.ImageIndex == 7 && tag.Data != null)
-                    {
-                        using (MemoryStream memoryStream = new MemoryStream(tag.Data))
-                            pctPreview.Image = new Bitmap(memoryStream);
-                    }
-                    else
-                        pctPreview.Image = null;
+                    SetPreviewImage(selectedNode.ImageIndex == 7 ? tag.Data : null);
                 }
             }
             else
@@ -108,7 +141,30 @@ namespace XeXtractor
                 lblType.Text = "";
                 grpInfo.Text = "";
                 lblFsize.Text = "";
-                pctPreview.Image = null;
+                SetPreviewImage(null);
+            }
+        }
+
+        private void SetPreviewImage(byte[] data)
+        {
+            Image previous = pctPreview.Image;
+            pctPreview.Image = null;
+            if (previous != null)
+                previous.Dispose();
+
+            if (data == null || data.Length == 0)
+                return;
+
+            try
+            {
+                // GDI+ needs the source stream for the image's lifetime, so copy it into a standalone bitmap.
+                using (MemoryStream memoryStream = new MemoryStream(data))
+                using (Image image = Image.FromStream(memoryStream))
+                    pctPreview.Image = new Bitmap(image);
+            }
+            catch (ArgumentException)
+            {
+                // Not a readable image; leave the preview empty.
             }
         }
 
@@ -166,7 +222,7 @@ namespace XeXtractor
         {
             if (InvokeRequired)
             {
-                Invoke(new EventHandler(Form1_LogChanged), sender, e);
+                InvokeIfAlive(new EventHandler(Form1_LogChanged), sender, e);
                 return;
             }
 
@@ -184,66 +240,93 @@ namespace XeXtractor
             new AboutBox1().ShowDialog();
         }
 
-        private void ExtractSubNodesToFolder(string folder, TreeNodeCollection root)
+        // Returns the number of entries that failed to save; failures are logged and extraction continues.
+        private int ExtractSubNodesToFolder(string folder, TreeNodeCollection root)
         {
+            int failures = 0;
             foreach (TreeNode treeNode in root)
             {
-                if (treeNode.Tag == null)
+                try
                 {
-                    ExtractSubNodesToFolder(Path.Combine(folder, treeNode.Text), treeNode.Nodes);
-                }
-                else
-                {
-                    FileEntry tag = (FileEntry)treeNode.Tag;
-                    if (!folder.Contains("\\XACH\\"))
+                    if (treeNode.Tag == null)
                     {
-                        string file = Path.Combine(folder, tag.fileName);
-                        tag.SaveAs(file);
+                        failures += ExtractSubNodesToFolder(SafePath.Combine(folder, treeNode.Text), treeNode.Nodes);
                     }
+                    else
+                    {
+                        FileEntry tag = (FileEntry)treeNode.Tag;
+                        if (!folder.Contains("\\XACH\\"))
+                            tag.SaveAs(SafePath.Combine(folder, tag.fileName));
+                    }
+                }
+                catch (Exception ex)
+                {
+                    failures++;
+                    Log.getInstance().AddEntry("Failed to extract " + treeNode.Text + ": " + ex.Message);
+                }
+            }
+            return failures;
+        }
+
+        private void ExtractNodesToFolder(TreeNodeCollection nodes)
+        {
+            string selectedPath;
+            using (FolderBrowserDialog folderBrowserDialog = new FolderBrowserDialog())
+            {
+                if (folderBrowserDialog.ShowDialog() != DialogResult.OK)
+                    return;
+                selectedPath = folderBrowserDialog.SelectedPath;
+            }
+
+            int failures = ExtractSubNodesToFolder(selectedPath, nodes);
+            if (failures > 0)
+                MessageBox.Show(failures + " item(s) could not be extracted. See the log for details.", "XeXtractor",
+                    MessageBoxButtons.OK, MessageBoxIcon.Warning);
+        }
+
+        private void ExtractSelectedNode()
+        {
+            TreeNode selectedNode = treeView1.SelectedNode;
+            if (selectedNode == null)
+                return;
+            if (selectedNode.Tag == null)
+            {
+                ExtractNodesToFolder(selectedNode.Nodes);
+                return;
+            }
+
+            FileEntry tag = (FileEntry)selectedNode.Tag;
+            using (SaveFileDialog saveFileDialog = new SaveFileDialog())
+            {
+                saveFileDialog.FileName = SafePath.SanitizeName(tag.fileName);
+                if (saveFileDialog.ShowDialog() != DialogResult.OK)
+                    return;
+                try
+                {
+                    tag.SaveAs(saveFileDialog.FileName);
+                }
+                catch (Exception ex)
+                {
+                    MessageBox.Show("Could not save file: " + ex.Message, "XeXtractor",
+                        MessageBoxButtons.OK, MessageBoxIcon.Error);
                 }
             }
         }
 
-        private void extractToolStripMenuItem_Click(object sender, EventArgs e)
-        {
-            TreeNode selectedNode = treeView1.SelectedNode;
-            if (selectedNode.Tag == null)
-            {
-                FolderBrowserDialog folderBrowserDialog = new FolderBrowserDialog();
-                if (folderBrowserDialog.ShowDialog() != DialogResult.OK)
-                    return;
-                ExtractSubNodesToFolder(folderBrowserDialog.SelectedPath, selectedNode.Nodes);
-            }
-            else
-            {
-                FileEntry tag = (FileEntry)selectedNode.Tag;
-                SaveFileDialog saveFileDialog = new SaveFileDialog();
-                saveFileDialog.FileName = tag.fileName;
-                if (saveFileDialog.ShowDialog() != DialogResult.OK)
-                    return;
-                tag.SaveAs(saveFileDialog.FileName);
-            }
-        }
+        private void extractToolStripMenuItem_Click(object sender, EventArgs e) => ExtractSelectedNode();
 
         private void openFileToolStripMenuItem_Click(object sender, EventArgs e)
         {
-            OpenFileDialog openFileDialog = new OpenFileDialog();
-            openFileDialog.Filter = "XEX file|*.xex|XSTR file|*.xstr|XSCR file|*.xscr|XDBF file|*.xdbf|XUIZ file|*.xuiz";
-            if (openFileDialog.ShowDialog() != DialogResult.OK)
-                return;
-            Cursor.Current = Cursors.WaitCursor;
-            Log.getInstance().Clear();
-            InnerFileStructure.getInstance().Clear();
-            FileHandler.HandleFile(openFileDialog.FileName);
+            using (OpenFileDialog openFileDialog = new OpenFileDialog())
+            {
+                openFileDialog.Filter = "XEX file|*.xex|XSTR file|*.xstr|XSCR file|*.xscr|XDBF file|*.xdbf|XUIZ file|*.xuiz";
+                if (openFileDialog.ShowDialog() != DialogResult.OK)
+                    return;
+                StartParse(openFileDialog.FileName);
+            }
         }
 
-        private void extractEverthingToolStripMenuItem_Click(object sender, EventArgs e)
-        {
-            FolderBrowserDialog folderBrowserDialog = new FolderBrowserDialog();
-            if (folderBrowserDialog.ShowDialog() != DialogResult.OK)
-                return;
-            ExtractSubNodesToFolder(folderBrowserDialog.SelectedPath, treeView1.Nodes);
-        }
+        private void extractEverthingToolStripMenuItem_Click(object sender, EventArgs e) => ExtractNodesToFolder(treeView1.Nodes);
 
         private void linkLabel1_LinkClicked(object sender, LinkLabelLinkClickedEventArgs e) => OpenSupportUrl();
 
@@ -266,10 +349,7 @@ namespace XeXtractor
             string[] data = (string[])e.Data.GetData(DataFormats.FileDrop);
             if (data == null || data.Length == 0)
                 return;
-            Log.getInstance().Clear();
-            InnerFileStructure.getInstance().Clear();
-            Cursor.Current = Cursors.WaitCursor;
-            FileHandler.HandleFile(data[0]);
+            StartParse(data[0]);
         }
 
         private void Form1_Load(object sender, EventArgs e)
@@ -277,10 +357,7 @@ namespace XeXtractor
             string[] commandLineArgs = Environment.GetCommandLineArgs();
             if (commandLineArgs.Length <= 1)
                 return;
-            Log.getInstance().Clear();
-            InnerFileStructure.getInstance().Clear();
-            Cursor.Current = Cursors.WaitCursor;
-            FileHandler.HandleFile(commandLineArgs[1]);
+            StartParse(commandLineArgs[1]);
         }
 
         private void treeView1_KeyUp(object sender, KeyEventArgs e) => HandleSelectedNode();
@@ -300,28 +377,7 @@ namespace XeXtractor
             return totalSize;
         }
 
-        private void button1_Click(object sender, EventArgs e)
-        {
-            TreeNode selectedNode = treeView1.SelectedNode;
-            if (selectedNode == null)
-                return;
-            if (selectedNode.Tag == null)
-            {
-                FolderBrowserDialog folderBrowserDialog = new FolderBrowserDialog();
-                if (folderBrowserDialog.ShowDialog() != DialogResult.OK)
-                    return;
-                ExtractSubNodesToFolder(folderBrowserDialog.SelectedPath, selectedNode.Nodes);
-            }
-            else
-            {
-                FileEntry tag = (FileEntry)selectedNode.Tag;
-                SaveFileDialog saveFileDialog = new SaveFileDialog();
-                saveFileDialog.FileName = tag.fileName;
-                if (saveFileDialog.ShowDialog() != DialogResult.OK)
-                    return;
-                tag.SaveAs(saveFileDialog.FileName);
-            }
-        }
+        private void button1_Click(object sender, EventArgs e) => ExtractSelectedNode();
 
         private void treeView1_NodeMouseDoubleClick(object sender, TreeNodeMouseClickEventArgs e)
         {
@@ -330,19 +386,33 @@ namespace XeXtractor
             TreeNode selectedNode = treeView1.SelectedNode;
             if (selectedNode.Tag == null)
                 return;
-            const string tempFolder = "TEMP";
-            if (!Directory.Exists(tempFolder))
-                Directory.CreateDirectory(tempFolder);
             try
             {
                 FileEntry tag = (FileEntry)selectedNode.Tag;
-                string tempPath = Path.Combine(tempFolder, tag.fileName);
+                Directory.CreateDirectory(TempFolder);
+                string tempPath = SafePath.Combine(TempFolder, tag.fileName);
                 tag.SaveAs(tempPath);
                 Process.Start(tempPath);
             }
             catch (Exception ex)
             {
                 MessageBox.Show(ex.Message);
+            }
+        }
+
+        private void Form1_FormClosed(object sender, FormClosedEventArgs e)
+        {
+            try
+            {
+                if (Directory.Exists(TempFolder))
+                    Directory.Delete(TempFolder, true);
+            }
+            catch (IOException)
+            {
+                // A previewed file may still be open in another program.
+            }
+            catch (UnauthorizedAccessException)
+            {
             }
         }
     }

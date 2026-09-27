@@ -10,20 +10,32 @@ namespace XeXtractor
 
         public static void HandleFile(string fileName)
         {
-            new Thread(HandleFileThreaded).Start(fileName);
+            Thread thread = new Thread(HandleFileThreaded);
+            thread.IsBackground = true;
+            thread.Start(fileName);
         }
 
         private static void HandleFileThreaded(object fileName)
         {
-            string path = fileName.ToString();
-            byte[] data = File.ReadAllBytes(path);
-            HandleFile(new FileEntry
+            try
             {
-                Data = data,
-                fileName = Path.GetFileNameWithoutExtension(path)
-            });
-            if (ParseCompleted != null)
-                ParseCompleted(null, EventArgs.Empty);
+                string path = fileName.ToString();
+                byte[] data = File.ReadAllBytes(path);
+                HandleFile(new FileEntry
+                {
+                    Data = data,
+                    fileName = Path.GetFileNameWithoutExtension(path)
+                });
+            }
+            catch (Exception ex)
+            {
+                Log.getInstance().AddEntry("Could not open file: " + ex.Message);
+            }
+            finally
+            {
+                if (ParseCompleted != null)
+                    ParseCompleted(null, EventArgs.Empty);
+            }
         }
 
         public static string GetFileType(byte[] data)
@@ -69,6 +81,14 @@ namespace XeXtractor
                         Log.getInstance().AddEntry("Unsupported file type: " + fileType);
                         break;
                 }
+            }
+            catch (DllNotFoundException)
+            {
+                Log.getInstance().AddEntry("Error: " + XCompress.LibraryName + " was not found. Copy it next to XeXtractor.exe to decompress XEX files.");
+            }
+            catch (BadImageFormatException)
+            {
+                Log.getInstance().AddEntry("Error: " + XCompress.LibraryName + " could not be loaded. Make sure it is the " + (IntPtr.Size == 8 ? "64" : "32") + "-bit version.");
             }
             catch (Exception ex)
             {
